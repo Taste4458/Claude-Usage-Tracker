@@ -15,6 +15,8 @@ class ClaudeAPIService: APIServiceProtocol {
 
     private let sessionKeyPath: URL
     private let sessionKeyValidator: SessionKeyValidator
+    private let oauthUsageLock = NSLock()
+    private var oauthUsageCache: [String: (usage: ClaudeUsage, capturedAt: Date)] = [:]
     let baseURL = Constants.APIEndpoints.claudeBase
     let consoleBaseURL = Constants.APIEndpoints.consoleBase
 
@@ -461,6 +463,7 @@ class ClaudeAPIService: APIServiceProtocol {
 
         if let data = try? await overageDataTask,
            let overage = try? JSONDecoder().decode(OverageSpendLimitResponse.self, from: data),
+           claudeUsage.costUsed == nil,
            overage.isEnabled == true {
             claudeUsage.costUsed = overage.usedCredits
             claudeUsage.costLimit = overage.monthlyCreditLimit
@@ -478,6 +481,10 @@ class ClaudeAPIService: APIServiceProtocol {
 
     /// Fetches usage data via OAuth access token (CLI credential flow)
     func fetchUsageData(oauthAccessToken: String) async throws -> ClaudeUsage {
+        if let cached = oauthUsageLock.withLock({ oauthUsageCache[oauthAccessToken] }),
+           Date().timeIntervalSince(cached.capturedAt) < 15 * 60 {
+            return cached.usage
+        }
         guard let url = URL(string: "https://api.anthropic.com/api/oauth/usage") else {
             throw AppError(code: .urlMalformed, message: "Invalid OAuth usage endpoint", isRecoverable: false)
         }
@@ -501,7 +508,13 @@ class ClaudeAPIService: APIServiceProtocol {
             )
         }
 
-        return try parseUsageResponse(data)
+        let usage = try parseUsageResponse(data)
+        oauthUsageLock.withLock {
+            let now = Date()
+            oauthUsageCache = oauthUsageCache.filter { now.timeIntervalSince($0.value.capturedAt) < 15 * 60 }
+            oauthUsageCache[oauthAccessToken] = (usage, now)
+        }
+        return usage
     }
 
     /// Fetches real usage data from Claude's API
@@ -526,6 +539,7 @@ class ClaudeAPIService: APIServiceProtocol {
             if checkOverage,
                let data = try? await overageDataTask,
                let overage = try? JSONDecoder().decode(OverageSpendLimitResponse.self, from: data),
+               claudeUsage.costUsed == nil,
                overage.isEnabled == true {
                 claudeUsage.costUsed = overage.usedCredits
                 claudeUsage.costLimit = overage.monthlyCreditLimit
@@ -541,94 +555,8 @@ class ClaudeAPIService: APIServiceProtocol {
 
             return claudeUsage
 
-        case .cliOAuth:
-            // The dedicated OAuth usage endpoint (api.anthropic.com/api/oauth/usage) is disabled.
-            // Instead, make a minimal Messages API call and extract usage from response headers.
-            LoggingService.shared.log("ClaudeAPIService: Fetching usage via Messages API headers (OAuth)")
-
-            guard let url = URL(string: "https://api.anthropic.com/v1/messages") else {
-                throw AppError(
-                    code: .urlMalformed,
-                    message: "Invalid Messages API endpoint",
-                    isRecoverable: false
-                )
-            }
-
-            var request = buildAuthenticatedRequest(url: url, auth: auth)
-            request.httpMethod = "POST"
-            request.setValue("2023-06-01", forHTTPHeaderField: "anthropic-version")
-            request.timeoutInterval = 30
-
-            // Minimal request: cheapest model, 1 token, to get rate limit headers
-            let body: [String: Any] = [
-                "model": "claude-haiku-4-5-20251001",
-                "max_tokens": 1,
-                "messages": [["role": "user", "content": "hi"]]
-            ]
-            request.httpBody = try JSONSerialization.data(withJSONObject: body)
-
-            let startTime = Date()
-            let (data, response): (Data, URLResponse)
-            do {
-                (data, response) = try await URLSession.shared.data(for: request)
-            } catch {
-                let duration = Date().timeIntervalSince(startTime)
-                NetworkLoggerService.shared.logRequest(
-                    url: url.absoluteString,
-                    method: "POST",
-                    requestBody: request.httpBody,
-                    responseData: nil,
-                    statusCode: nil,
-                    duration: duration,
-                    error: error
-                )
-                throw error
-            }
-
-            let duration = Date().timeIntervalSince(startTime)
-
-            guard let httpResponse = response as? HTTPURLResponse else {
-                throw AppError(
-                    code: .apiInvalidResponse,
-                    message: "Invalid response from Messages API",
-                    isRecoverable: true
-                )
-            }
-
-            // Log to NetworkLoggerService
-            NetworkLoggerService.shared.logRequest(
-                url: url.absoluteString,
-                method: "POST",
-                requestBody: request.httpBody,
-                responseData: data,
-                statusCode: httpResponse.statusCode,
-                duration: duration,
-                error: nil
-            )
-
-            // A 429 means the account is at its rate limit — which is exactly
-            // what we're here to measure. The unified rate-limit headers are
-            // still present on 429 responses, so parse them instead of
-            // failing the refresh right when the user most needs the data.
-            let has429UsageHeaders = httpResponse.statusCode == 429
-                && httpResponse.value(forHTTPHeaderField: "anthropic-ratelimit-unified-5h-utilization") != nil
-
-            guard httpResponse.statusCode == 200 || has429UsageHeaders else {
-                let responsePreview = String(data: data, encoding: .utf8)?.prefix(200) ?? "Unable to read response"
-                throw AppError(
-                    code: httpResponse.statusCode == 429 ? .apiRateLimited : .apiUnauthorized,
-                    message: httpResponse.statusCode == 429
-                        ? "Rate limited by Claude API"
-                        : "OAuth Messages API request failed",
-                    technicalDetails: "Status: \(httpResponse.statusCode)\nResponse: \(responsePreview)",
-                    isRecoverable: true,
-                    recoverySuggestion: httpResponse.statusCode == 429
-                        ? "Usage is at its limit — data will refresh once the rate limit window resets"
-                        : "Please re-sync your CLI account in Settings"
-                )
-            }
-
-            return parseUsageFromRateLimitHeaders(httpResponse)
+        case .cliOAuth(let accessToken):
+            return try await fetchUsageData(oauthAccessToken: accessToken)
 
         case .consoleAPISession:
             // Console API is for billing/credits only, not usage data
@@ -788,7 +716,7 @@ class ClaudeAPIService: APIServiceProtocol {
 
     // MARK: - Response Parsing
 
-    private func parseUsageResponse(_ data: Data) throws -> ClaudeUsage {
+    func parseUsageResponse(_ data: Data) throws -> ClaudeUsage {
         // Parse Claude's actual API response structure
 
         if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
@@ -915,6 +843,21 @@ class ClaudeAPIService: APIServiceProtocol {
             let designTokens = Int(Double(weeklyLimit) * (designPercentage / 100.0))
             let fableTokens = Int(Double(weeklyLimit) * (fablePercentage / 100.0))
 
+            var costUsed: Double?
+            var costLimit: Double?
+            var costCurrency: String?
+            if let extra = json["extra_usage"] as? [String: Any],
+               extra["is_enabled"] as? Bool == true {
+                let decimalPlaces = extra["decimal_places"] as? Int ?? 2
+                if (0...9).contains(decimalPlaces) {
+                    // Existing views and saved usage represent money in hundredths.
+                    let scale = pow(10.0, Double(2 - decimalPlaces))
+                    costUsed = (extra["used_credits"] as? Double).map { $0 * scale }
+                    costLimit = (extra["monthly_limit"] as? Double).map { $0 * scale }
+                    costCurrency = extra["currency"] as? String ?? "USD"
+                }
+            }
+
             let usage = ClaudeUsage(
                 sessionTokensUsed: sessionTokens,
                 sessionLimit: sessionLimit,
@@ -935,9 +878,9 @@ class ClaudeAPIService: APIServiceProtocol {
                 fableWeeklyTokensUsed: fableTokens,
                 fableWeeklyPercentage: fablePercentage,
                 fableWeeklyResetTime: fableResetTime,
-                costUsed: nil,
-                costLimit: nil,
-                costCurrency: nil,
+                costUsed: costUsed,
+                costLimit: costLimit,
+                costCurrency: costCurrency,
                 lastUpdated: Date(),
                 userTimezone: .current
             )
